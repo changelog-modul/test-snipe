@@ -20,7 +20,7 @@ local request = http_request or request or (syn and syn.request) or (fluxus and 
         local teleported = false
         
         -- === AUTO RELOAD AFTER TELEPORT ===
-local SCRIPT_URL = "https://raw.githubusercontent.com/USER/REPO/main/script.lua"
+local SCRIPT_URL = "https://raw.githubusercontent.com/changelog-modul/test-snipe/refs/heads/main/snipe"
 
 if queue_on_teleport then
     queue_on_teleport(game:HttpGet(SCRIPT_URL))

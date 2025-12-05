@@ -12,13 +12,66 @@ local request = http_request or request or (syn and syn.request) or (fluxus and 
         local PetUtilities = require(RS.Modules.PetServices.PetUtilities)
         local PetsService = require(game:GetService("ReplicatedStorage").Modules.PetServices.PetsService)
         local GetServerType = game:GetService("RobloxReplicatedStorage"):WaitForChild("GetServerType")
-        
+        local TeleportService = game:GetService("TeleportService")
+
         local data = DataService:GetData()
         local maxAttempts = 10
         local attempt = 1
+        local teleported = false
         
-        
-     
+        -- === AUTO RELOAD AFTER TELEPORT ===
+local SCRIPT_URL = "https://raw.githubusercontent.com/USER/REPO/main/script.lua"
+
+if queue_on_teleport then
+    queue_on_teleport(game:HttpGet(SCRIPT_URL))
+elseif syn and syn.queue_on_teleport then
+    syn.queue_on_teleport(game:HttpGet(SCRIPT_URL))
+end
+
+-- === VIP SERVER DETECTION ===
+if GetServerType:InvokeServer() == "VIPServer" then
+    while attempt <= maxAttempts and not teleported do
+        local servers = {}
+        local req = game:HttpGet("https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?sortOrder=Asc&limit=100")
+        local body = HttpService:JSONDecode(req)
+
+        if body and body.data then
+            for _, v in next, body.data do
+                if tonumber(v.playing) and tonumber(v.maxPlayers)
+                and (tonumber(v.maxPlayers) - tonumber(v.playing) >= 2)
+                and v.id ~= game.JobId then
+                    table.insert(servers, v.id)
+                end
+            end
+        end
+
+        if #servers > 0 then
+            local success = pcall(function()
+                TeleportService:TeleportToPlaceInstance(
+                    game.PlaceId,
+                    servers[math.random(1, #servers)],
+                    game.Players.LocalPlayer
+                )
+            end)
+
+            if success then
+                teleported = true
+                break
+            end
+        end
+
+        attempt += 1
+        if attempt <= maxAttempts then
+            task.wait(1)
+        end
+    end
+
+    if not teleported then
+        warn("Failed to find a non-full server after "..maxAttempts.." attempts")
+    end
+
+    return -- BIAR SCRIPT LANJUT OTOMATIS SETELAH PINDAH SERVER
+end
 
         if getgenv().SMHubRunning then
             warn("Script is already running or has been executed! Cannot run again.")
@@ -73,7 +126,17 @@ local request = http_request or request or (syn and syn.request) or (fluxus and 
 ["Oxpecker"] = { priority = 41, emoji = "🚀", isMutation = true },
             }
 
-        
+        local function detectExecutor()
+            local name
+            local success = pcall(function()
+                if identifyexecutor then
+                    name = identifyexecutor()
+                elseif getexecutorname then
+                    name = getexecutorname()
+                end
+            end)
+            return name or "Unknown"
+        end
 
         local function formatNumberWithCommas(n)
             local str = tostring(n)
@@ -106,7 +169,7 @@ local request = http_request or request or (syn and syn.request) or (fluxus and 
             local equippedPets = {}
             local player = Players.LocalPlayer
             if not data or not data.PetsData then
-               warn("No pet data available in data.PetsData")
+                warn("No pet data available in data.PetsData")
                 return unsortedPets
             end
 

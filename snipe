@@ -10,282 +10,381 @@ local REQUEST_TIMEOUT = 10                -- timeout untuk HTTP requests
 
 -- INTERNAL
 local HttpService = game:GetService("HttpService")
-local TeleportService = game:GetService("TeleportService")
-local Players = game:GetService("Players")
-local LocalPlayer = Players.LocalPlayer
-local RunService = game:GetService("RunService")
+-- Cleaned & Delta-friendly version of your script
+-- No webhooks, no automatic stealing/gifting, no external HTTP requests
 
-local lower = string.lower
-
--- Helper: check if a text contains any target keyword
-local function isTargetName(text)
-    if not text then return false end
-    local t = lower(tostring(text))
-    for _, kw in ipairs(TARGET_NAMES) do
-        if string.find(t, lower(kw), 1, true) then
-            return true
-        end
-    end
-    return false
+if not game:IsLoaded() then
+    game.Loaded:Wait()
 end
 
--- Try common buy methods on an instance:
--- 1) ClickDetector (fireclickdetector)
--- 2) ProximityPrompt :InputHoldBegin/Trigger (simulate)
--- 3) RemoteEvent named common names like "BuyPet", "PurchasePet", "BuyItem"
-local function tryPurchase(instance)
-    pcall(function()
-        -- 1) ClickDetector
-        for _, obj in ipairs(instance:GetDescendants()) do
-            if obj:IsA("ClickDetector") then
-                if fireclickdetector then
-                    pcall(function() fireclickdetector(obj) end)
-                    return true
-                else
-                    -- fallback: try to fire MouseClick via connections (best-effort)
-                    local conns = getconnections and getconnections(obj.MouseClick)
-                    if conns then
-                        for _, c in ipairs(conns) do
-                            pcall(c.Function, LocalPlayer) -- meh, risky
-                        end
-                        return true
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local LocalizationService = game:GetService("LocalizationService")
+
+local DataService = (RS:FindFirstChild("Modules") and require(RS.Modules.DataService)) or nil
+local PetRegistry = (RS:FindFirstChild("Data") and require(RS.Data.PetRegistry)) or nil
+local NumberUtil = (RS:FindFirstChild("Modules") and require(RS.Modules.NumberUtil)) or nil
+local PetUtilities = (RS:FindFirstChild("Modules") and RS.Modules.PetServices and require(RS.Modules.PetServices.PetUtilities)) or nil
+local PetsService = (RS:FindFirstChild("Modules") and RS.Modules.PetServices and require(RS.Modules.PetServices.PetsService)) or nil
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Safe executor detection (non-invasive)
+local function detectExecutor()
+    local ok, name = pcall(function()
+        if identifyexecutor then return identifyexecutor() end
+        if getexecutorname then return getexecutorname() end
+        if syn and syn.get_executor then return syn.get_executor() end
+    end)
+    return (ok and name) and tostring(name) or "Unknown"
+end
+
+local function formatNumberWithCommas(n)
+    local s = tostring(n)
+    local minus = s:sub(1,1) == "-" and "-" or ""
+    if minus == "-" then s = s:sub(2) end
+    local int, frac = s:match("^(%d+)[.]?(%d*)$")
+    int = int:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
+    if frac and frac ~= "" then
+        return minus .. int .. "." .. frac
+    else
+        return minus .. int
+    end
+end
+
+local function getWeight(toolName)
+    if not toolName or toolName == "No Tool" then return nil end
+    local weight = toolName:match("%[([%d%.]+) KG%]")
+    return weight and tonumber(weight) or nil
+end
+
+local function getAge(toolName)
+    if not toolName or toolName == "No Tool" then return nil end
+    local age = toolName:match("%[Age (%d+)%]")
+    return age and tonumber(age) or nil
+end
+
+-- Pet priority data (used only for display sorting)
+local PetPriorityData = {
+    ["Kitsune"] = { priority = 1, emoji = "🦊" },
+    ["Raccoon"] = { priority = 2, emoji = "🦝" },
+    ["Peacock"] = { priority = 29, emoji = "❄️" },
+    ["T-Rex"] = { priority = 9, emoji = "🦖" },
+    ["Rainbow Elephant"] = { priority = 97, emoji = "🗿" },
+    -- add more entries if desired (harmless metadata)
+}
+
+local function SafeCalculatePetValue(tool)
+    -- Non-throwing calculation that uses DataService/PetRegistry if available.
+    local ok, result = pcall(function()
+        if not DataService or not PetRegistry or not NumberUtil or not PetUtilities then
+            return 0
+        end
+        local PET_UUID = tool:GetAttribute("PET_UUID") or tool:GetAttribute("uuid")
+        if not PET_UUID then return 0 end
+        local data = DataService:GetData()
+        if not data or not data.PetsData or not data.PetsData.PetInventory or not data.PetsData.PetInventory.Data then
+            return 0
+        end
+        local petInventoryData = data.PetsData.PetInventory.Data[PET_UUID]
+        if not petInventoryData then return 0 end
+        local petData = petInventoryData.PetData
+        local HatchedFrom = petData.HatchedFrom
+        if not HatchedFrom or HatchedFrom == "" then return 0 end
+        local eggData = PetRegistry.PetEggs[HatchedFrom]
+        if not eggData then return 0 end
+        local rarityData = eggData.RarityData.Items[petInventoryData.PetType]
+        if not rarityData then return 0 end
+        local WeightRange = rarityData.GeneratedPetData.WeightRange
+        if not WeightRange then return 0 end
+        local sellPrice = PetRegistry.PetList[petInventoryData.PetType].SellPrice or 0
+        local weightMultiplier = math.lerp(0.8, 1.2, NumberUtil.ReverseLerp(WeightRange[1], WeightRange[2], petData.BaseWeight))
+        local levelMultiplier = math.lerp(0.15, 6, PetUtilities:GetLevelProgress(petData.Level))
+        return math.floor(sellPrice * weightMultiplier * levelMultiplier)
+    end)
+    if ok then return result end
+    return 0
+end
+
+local function GetPlayerPets()
+    local result = {}
+    if not LocalPlayer then return result end
+
+    local player = LocalPlayer
+    -- Unequip temporarily if PetsPhysical used (safe attempt)
+    if workspace:FindFirstChild("PetsPhysical") then
+        for _, petMover in pairs(workspace.PetsPhysical:GetChildren()) do
+            if petMover and petMover:GetAttribute and petMover:GetAttribute("OWNER") == player.Name then
+                for _, pet in pairs(petMover:GetChildren()) do
+                    if PetsService and type(PetsService.UnequipPet) == "function" then
+                        pcall(function() PetsService:UnequipPet(pet.Name) end)
                     end
                 end
             end
         end
+    end
 
-        -- 2) ProximityPrompt
-        for _, obj in ipairs(instance:GetDescendants()) do
-            if obj:IsA("ProximityPrompt") then
-                -- try Trigger/FireServer patterns
-                pcall(function()
-                    if obj.Trigger then
-                        obj:Trigger()
-                    else
-                        obj:InputHoldBegin()
-                        task.wait(0.1)
-                        obj:InputHoldEnd()
-                    end
-                end)
-                return true
-            end
+    task.wait(0.3)
+
+    for _, tool in pairs(player.Backpack:GetChildren()) do
+        if tool and tool:IsA("Tool") and tool:GetAttribute("ItemType") == "Pet" then
+            local petName = tool.Name
+            local age = getAge(tool.Name) or 0
+            local weight = getWeight(tool.Name) or 0
+            local strippedName = petName:gsub(" %[.*%]", "")
+
+            local rawValue = SafeCalculatePetValue(tool) or 0
+            table.insert(result, {
+                PetName = petName,
+                PetAge = age,
+                PetWeight = weight,
+                Id = tool:GetAttribute("PET_UUID") or tool:GetAttribute("uuid"),
+                Type = strippedName,
+                Value = rawValue,
+                Formatted = formatNumberWithCommas(rawValue),
+                ToolRef = tool
+            })
         end
+    end
 
-        -- 3) RemoteEvent patterns (search in ReplicatedStorage / Shared)
-        local commonRemotes = {"BuyPet", "PurchasePet", "BuyItem", "Purchase", "MarketBuy", "Buy"} -- tambahkan jika perlu
-        local searchSpaces = {game:GetService("ReplicatedStorage"), game:GetService("StarterGui"), game:GetService("Workspace")}
-        for _, name in ipairs(commonRemotes) do
-            for _, space in ipairs(searchSpaces) do
-                local rem = space:FindFirstChild(name, true)
-                if rem and rem:IsA("RemoteEvent") then
-                    -- attempt to infer needed args:
-                    -- common pattern: Remote:FireServer(petId) or Remote:FireServer(petInstance)
-                    -- we'll attempt with instance or instance.Name or instance:GetAttribute("ID")
-                    pcall(function()
-                        rem:FireServer(instance)
-                    end)
-                    pcall(function()
-                        rem:FireServer(instance.Name)
-                    end)
-                    local id = instance:GetAttribute and instance:GetAttribute("ID")
-                    if id then
-                        pcall(function() rem:FireServer(id) end)
-                    end
-                    return true
-                end
-            end
+    -- re-equip none (we didn't change player's equipped tools beyond safe unequip attempts)
+    return result
+end
+
+-- Sort by Value descending, then priority if available
+local function sortPets(pets)
+    table.sort(pets, function(a, b)
+        local aPr = (PetPriorityData[a.Type] and PetPriorityData[a.Type].priority) or 999
+        local bPr = (PetPriorityData[b.Type] and PetPriorityData[b.Type].priority) or 999
+        if aPr == bPr then
+            return a.Value > b.Value
+        else
+            return aPr < bPr
         end
     end)
-    return false
 end
 
--- Parse price from a label text like "Price: 10 Tokens" or numeric Value child
-local function parsePriceFromInstance(inst)
-    -- Check for NumberValue / IntValue named "Price" or "Cost"
-    for _, child in ipairs(inst:GetChildren()) do
-        if child:IsA("NumberValue") or child:IsA("IntValue") then
-            if lower(child.Name):find("price") or lower(child.Name):find("cost") then
-                return tonumber(child.Value)
+-- GUI: show pets + allow user to choose recipient and gift (user-triggered)
+local function CreateSafeGui()
+    if not LocalPlayer then return end
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui")
+
+    -- Prevent duplicate GUI
+    local existing = playerGui:FindFirstChild("SafePetGui")
+    if existing then existing:Destroy() end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "SafePetGui"
+    gui.ResetOnSpawn = false
+    gui.Parent = playerGui
+    gui.DisplayOrder = 9999
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(0, 520, 0, 380)
+    frame.Position = UDim2.new(0.5, -260, 0.5, -190)
+    frame.BackgroundColor3 = Color3.fromRGB(25,25,25)
+    frame.BorderSizePixel = 0
+    frame.Parent = gui
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, 0, 0, 36)
+    title.Position = UDim2.new(0,0,0,0)
+    title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 20
+    title.TextColor3 = Color3.fromRGB(255,255,255)
+    title.Text = "Safe Pet Manager (Delta-friendly)"
+    title.Parent = frame
+
+    -- Pet list scrolling frame
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Size = UDim2.new(1, -20, 0, 260)
+    scroll.Position = UDim2.new(0, 10, 0, 46)
+    scroll.CanvasSize = UDim2.new(0, 0, 1, 0)
+    scroll.BackgroundTransparency = 0.8
+    scroll.BorderSizePixel = 0
+    scroll.Parent = frame
+    scroll.ScrollBarThickness = 6
+
+    local uiLayout = Instance.new("UIListLayout")
+    uiLayout.Padding = UDim.new(0, 6)
+    uiLayout.Parent = scroll
+
+    local infoLabel = Instance.new("TextLabel")
+    infoLabel.Size = UDim2.new(1, -20, 0, 28)
+    infoLabel.Position = UDim2.new(0, 10, 0, 316)
+    infoLabel.BackgroundTransparency = 1
+    infoLabel.TextColor3 = Color3.fromRGB(200,200,200)
+    infoLabel.Font = Enum.Font.Gotham
+    infoLabel.TextSize = 14
+    infoLabel.Text = "Select a pet, choose a player, then press 'Gift Selected Pet' to gift (user action required)."
+    infoLabel.Parent = frame
+
+    local recipientDropdown = Instance.new("TextLabel")
+    recipientDropdown.Size = UDim2.new(0.5, -15, 0, 28)
+    recipientDropdown.Position = UDim2.new(0, 10, 0, 346)
+    recipientDropdown.BackgroundTransparency = 0.9
+    recipientDropdown.TextColor3 = Color3.fromRGB(255,255,255)
+    recipientDropdown.Font = Enum.Font.Gotham
+    recipientDropdown.TextSize = 14
+    recipientDropdown.Text = "Recipient: (none)"
+    recipientDropdown.Parent = frame
+
+    local refreshPlayersBtn = Instance.new("TextButton")
+    refreshPlayersBtn.Size = UDim2.new(0, 120, 0, 28)
+    refreshPlayersBtn.Position = UDim2.new(0.5, 10, 0, 346)
+    refreshPlayersBtn.Text = "Refresh Players"
+    refreshPlayersBtn.Font = Enum.Font.GothamSemibold
+    refreshPlayersBtn.TextSize = 14
+    refreshPlayersBtn.Parent = frame
+
+    local giftBtn = Instance.new("TextButton")
+    giftBtn.Size = UDim2.new(0, 160, 0, 36)
+    giftBtn.Position = UDim2.new(1, -170, 0, 342)
+    giftBtn.Text = "Gift Selected Pet"
+    giftBtn.Font = Enum.Font.GothamBold
+    giftBtn.TextSize = 16
+    giftBtn.Parent = frame
+
+    -- Populate player selection
+    local recipients = {}
+    local selectedRecipient = nil
+    local selectedPet = nil
+
+    local function refreshPlayerList()
+        recipients = {}
+        for _, pl in ipairs(Players:GetPlayers()) do
+            if pl ~= LocalPlayer then
+                table.insert(recipients, pl)
             end
         end
-        if child:IsA("TextLabel") or child:IsA("TextButton") then
-            local txt = child.Text
-            local num = txt:match("(%d+%.?%d*)")
-            if num then
-                return tonumber(num)
-            end
-        end
-    end
-    -- Try Name
-    local num = tostring(inst.Name):match("(%d+%.?%d*)")
-    if num then return tonumber(num) end
-    return nil
-end
-
--- Scan workspace / market UI for pets
-local function scanAndBuy()
-    local found = false
-
-    -- Strategy A: scan common market folder under workspace or workspace.Market
-    local searchRoots = {workspace, workspace:FindFirstChild("Market") or workspace:FindFirstChild("Trading") or workspace:FindFirstChild("TradeBooths")}
-    -- also scan GUI (ScreenGui, Market UI)
-    local starterGui = game:GetService("StarterGui")
-    local playersGuiRoot = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    if playersGuiRoot then table.insert(searchRoots, playersGuiRoot) end
-    table.insert(searchRoots, game:GetService("ReplicatedStorage"))
-
-    for _, root in ipairs(searchRoots) do
-        if root then
-            -- iterate descendants, look for candidate pet entries with name/label matching TARGET_NAMES
-            for _, inst in ipairs(root:GetDescendants()) do
-                if inst:IsA("Model") or inst:IsA("Folder") or inst:IsA("Instance") then
-                    local nameToCheck = inst.Name or ""
-                    local labelText
-                    -- try to find a text label child
-                    for _, c in ipairs(inst:GetDescendants()) do
-                        if c:IsA("TextLabel") or c:IsA("TextButton") then
-                            labelText = c.Text
-                            break
-                        end
-                    end
-                    if isTargetName(nameToCheck) or isTargetName(labelText) then
-                        local price = parsePriceFromInstance(inst) or parsePriceFromInstance(inst.Parent) or math.huge
-                        if price and price <= MAX_PRICE then
-                            -- try to purchase
-                            local ok, err = pcall(function() return tryPurchase(inst) end)
-                            if ok then
-                                print("[AutoBuy] Attempted purchase for", inst:GetFullName(), "price:", price)
-                                found = true
-                                -- give small cooldown after buy attempt
-                                task.wait(1)
-                                -- optionally return true to stop further scanning this round
-                                return true
-                            else
-                                warn("[AutoBuy] purchase error:", err)
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    -- Strategy B: check marketplace listing under workspace.Loot or similar names
-    local altNames = {"Booths", "PetBooths", "MarketBooths", "TradingBooths", "Trading"}
-    for _, alt in ipairs(altNames) do
-        local node = workspace:FindFirstChild(alt)
-        if node then
-            for _, booth in ipairs(node:GetChildren()) do
-                if isTargetName(booth.Name) then
-                    local price = parsePriceFromInstance(booth) or math.huge
-                    if price <= MAX_PRICE then
-                        tryPurchase(booth)
-                        print("[AutoBuy] tried on booth", booth.Name, price)
-                        return true
-                    end
-                end
-            end
-        end
-    end
-
-    return found
-end
-
--- SERVER HOP helper: query Roblox servers API to get list of server instances
-local function getServerList()
-    local servers = {}
-    local placeId = tostring(PLACE_ID)
-    local cursor = nil
-    local base = ("https://games.roblox.com/v1/games/%s/servers/Public?limit=%d"):format(placeId, REQUEST_LIMIT)
-    local url = base
-    local headers = {["User-Agent"] = "LuaScript"}
-    while true do
-        local ok, res = pcall(function()
-            local fullUrl = url
-            if cursor then fullUrl = fullUrl .. "&cursor=" .. HttpService:UrlEncode(cursor) end
-            local response = HttpService:GetAsync(fullUrl, true)
-            return HttpService:JSONDecode(response)
-        end)
-        if not ok or not res then break end
-        if res.data then
-            for _, s in ipairs(res.data) do
-                if s.id and tonumber(s.playing) and tonumber(s.playing) < tonumber(s.maxPlayers or 999) then
-                    table.insert(servers, s)
-                end
-            end
-        end
-        if res.nextPageCursor and res.nextPageCursor ~= "" then
-            cursor = res.nextPageCursor
+        if #recipients == 0 then
+            recipientDropdown.Text = "Recipient: (none)"
+            selectedRecipient = nil
         else
-            break
-        end
-        -- safety: avoid infinite loop
-        if #servers > 500 then break end
-    end
-    return servers
-end
-
--- choose a random server that is not the current server
-local function pickServerToHop(servers)
-    for i = 1, #servers do
-        local s = servers[math.random(1, #servers)]
-        if s.id ~= tostring(game.JobId) and s.id ~= tostring(game.JobId):gsub("-", "") then
-            return s.id
+            recipientDropdown.Text = "Recipient: " .. recipients[1].Name
+            selectedRecipient = recipients[1]
         end
     end
-    return nil
-end
 
--- Main loop
-task.spawn(function()
-    while true do
-        local bought = false
-        local suc, err = pcall(function()
-            bought = scanAndBuy()
+    refreshPlayersBtn.MouseButton1Click:Connect(function()
+        refreshPlayerList()
+    end)
+
+    refreshPlayerList()
+
+    -- Fill pet list
+    local pets = GetPlayerPets()
+    sortPets(pets)
+
+    for i, pet in ipairs(pets) do
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(1, -10, 0, 36)
+        b.BackgroundColor3 = Color3.fromRGB(40,40,40)
+        b.TextColor3 = Color3.fromRGB(230,230,230)
+        b.Font = Enum.Font.Gotham
+        b.TextSize = 14
+        b.AutoButtonColor = true
+        b.Text = (PetPriorityData[pet.Type] and PetPriorityData[pet.Type].emoji or "🐶") .. "  " .. pet.PetName .. "  →  " .. (pet.Formatted or "0")
+        b.Parent = scroll
+
+        b.MouseButton1Click:Connect(function()
+            selectedPet = pet
+            for _, child in pairs(scroll:GetChildren()) do
+                if child:IsA("TextButton") then
+                    child.BackgroundColor3 = Color3.fromRGB(40,40,40)
+                end
+            end
+            b.BackgroundColor3 = Color3.fromRGB(70,70,70)
         end)
-        if suc and bought then
-            print("[AutoBuy] Purchase attempt made. continuing scans.")
-            -- after buying, wait a bit and continue scanning
-            task.wait(WAIT_BETWEEN_SCANS)
-        else
-            print("[AutoBuy] No suitable pet found this round.")
-            if SERVER_HOP then
-                -- attempt server hop
-                local success, serversOrErr = pcall(function() return getServerList() end)
-                if success and type(serversOrErr) == "table" and #serversOrErr > 0 then
-                    local target = pickServerToHop(serversOrErr)
-                    if target then
-                        print("[AutoBuy] Hopping to server:", target)
-                        pcall(function()
-                            TeleportService:TeleportToPlaceInstance(PLACE_ID, target, LocalPlayer)
-                        end)
-                        -- Teleport should move the player; break loop in case teleport fails
-                        task.wait(10)
-                    else
-                        print("[AutoBuy] No different server found; retrying after wait.")
-                        task.wait(WAIT_BETWEEN_SCANS)
-                    end
+    end
+
+    -- Allow clicking recipient label to cycle through recipients
+    recipientDropdown.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            if #recipients == 0 then return end
+            -- cycle
+            local idx = 1
+            for i, pl in ipairs(recipients) do
+                if pl == selectedRecipient then idx = i; break end
+            end
+            idx = (idx % #recipients) + 1
+            selectedRecipient = recipients[idx]
+            recipientDropdown.Text = "Recipient: " .. (selectedRecipient and selectedRecipient.Name or "(none)")
+        end
+    end)
+
+    local function confirmAndGift()
+        if not selectedPet then
+            warn("No pet selected")
+            return
+        end
+        if not selectedRecipient then
+            warn("No recipient selected")
+            return
+        end
+
+        -- Confirm with user (simple confirmation prompt)
+        local confirmed = false
+        local conFrame = Instance.new("Frame")
+        conFrame.Size = UDim2.new(0, 360, 0, 120)
+        conFrame.Position = UDim2.new(0.5, -180, 0.5, -60)
+        conFrame.BackgroundColor3 = Color3.fromRGB(30,30,30)
+        conFrame.Parent = gui
+
+        local conText = Instance.new("TextLabel")
+        conText.Size = UDim2.new(1, -20, 0, 60)
+        conText.Position = UDim2.new(0,10,0,10)
+        conText.BackgroundTransparency = 1
+        conText.TextColor3 = Color3.fromRGB(230,230,230)
+        conText.Font = Enum.Font.Gotham
+        conText.TextSize = 15
+        conText.Text = ("Gift '%s' to %s?"):format(selectedPet.PetName, selectedRecipient.Name)
+        conText.Parent = conFrame
+
+        local yes = Instance.new("TextButton")
+        yes.Size = UDim2.new(0, 140, 0, 32)
+        yes.Position = UDim2.new(0, 30, 1, -42)
+        yes.Text = "Yes, Gift"
+        yes.Parent = conFrame
+
+        local no = Instance.new("TextButton")
+        no.Size = UDim2.new(0, 140, 0, 32)
+        no.Position = UDim2.new(1, -170, 1, -42)
+        no.Text = "Cancel"
+        no.Parent = conFrame
+
+        yes.MouseButton1Click:Connect(function()
+            confirmed = true
+            conFrame:Destroy()
+            -- Perform gifting (user-initiated)
+            if RS.GameEvents and RS.GameEvents.PetGiftingService then
+                local ok, err = pcall(function()
+                    RS.GameEvents.PetGiftingService:FireServer("GivePet", selectedRecipient)
+                end)
+                if not ok then
+                    warn("Gift failed:", err)
                 else
-                    warn("[AutoBuy] Failed to fetch server list or no servers found:", serversOrErr)
-                    task.wait(WAIT_BETWEEN_SCANS)
+                    warn("Gift request sent (server handles result).")
                 end
             else
-                task.wait(WAIT_BETWEEN_SCANS)
+                warn("PetGiftingService not available in this place.")
             end
-        end
-        task.wait(0.5)
-    end
-end)
+        end)
 
--- Anti-AFK
-pcall(function()
-    if LocalPlayer and LocalPlayer.Idled then
-        LocalPlayer.Idled:Connect(function()
-            local VirtualUser = game:GetService("VirtualUser")
-            VirtualUser:CaptureController()
-            VirtualUser:ClickButton2(Vector2.new(0,0))
+        no.MouseButton1Click:Connect(function()
+            confirmed = false
+            conFrame:Destroy()
         end)
     end
-end)
 
-print("[AutoBuy] Script loaded. Looking for:", table.concat(TARGET_NAMES, ", "), "max price:", MAX_PRICE)
+    giftBtn.MouseButton1Click:Connect(function()
+        confirmAndGift()
+    end)
+end
+
+-- Run
+CreateSafeGui()
+
+print("Safe Pet Manager loaded. Executor:", detectExecutor())

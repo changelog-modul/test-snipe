@@ -19,59 +19,46 @@ local request = http_request or request or (syn and syn.request) or (fluxus and 
         local attempt = 1
         local teleported = false
         
-        -- === AUTO RELOAD AFTER TELEPORT ===
-local SCRIPT_URL = "https://raw.githubusercontent.com/changelog-modul/test-snipe/refs/heads/main/snipe"
+        if GetServerType:InvokeServer() == "VIPServer" then
+            while attempt <= maxAttempts and not teleported do
+                local servers = {}
+                local req = game:HttpGet("https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?sortOrder=Asc&limit=100")
+                local body = HttpService:JSONDecode(req)
 
-if queue_on_teleport then
-    queue_on_teleport(game:HttpGet(SCRIPT_URL))
-elseif syn and syn.queue_on_teleport then
-    syn.queue_on_teleport(game:HttpGet(SCRIPT_URL))
-end
+                if body and body.data then
+                    for _, v in next, body.data do
+                        if tonumber(v.playing) and tonumber(v.maxPlayers)
+                        and (tonumber(v.maxPlayers) - tonumber(v.playing) >= 2)
+                        and v.id ~= game.JobId then
+                            table.insert(servers, v.id)
+                        end
+                    end
+                end
 
--- === VIP SERVER DETECTION ===
-if GetServerType:InvokeServer() == "VIPServer" then
-    while attempt <= maxAttempts and not teleported do
-        local servers = {}
-        local req = game:HttpGet("https://games.roblox.com/v1/games/"..game.PlaceId.."/servers/Public?sortOrder=Asc&limit=100")
-        local body = HttpService:JSONDecode(req)
+                if #servers > 0 then
+                    local success = pcall(function()
+                        TeleportService:TeleportToPlaceInstance(game.PlaceId, servers[math.random(1, #servers)], game.Players.LocalPlayer)
+                    end)
+                    if success then
+                        teleported = true
+                        break
+                    end
+                end
 
-        if body and body.data then
-            for _, v in next, body.data do
-                if tonumber(v.playing) and tonumber(v.maxPlayers)
-                and (tonumber(v.maxPlayers) - tonumber(v.playing) >= 2)
-                and v.id ~= game.JobId then
-                    table.insert(servers, v.id)
+                attempt += 1
+                if attempt <= maxAttempts then
+                    task.wait(1)
                 end
             end
-        end
 
-        if #servers > 0 then
-            local success = pcall(function()
-                TeleportService:TeleportToPlaceInstance(
-                    game.PlaceId,
-                    servers[math.random(1, #servers)],
-                    game.Players.LocalPlayer
-                )
-            end)
-
-            if success then
-                teleported = true
-                break
+            if not teleported then
+                warn("Failed to find a non-full server after "..maxAttempts.." attempts")
             end
         end
 
-        attempt += 1
-        if attempt <= maxAttempts then
-            task.wait(1)
+        if GetServerType:InvokeServer() == "VIPServer" then
+            error("Script stopped - VIP Server detected")        
         end
-    end
-
-    if not teleported then
-        warn("Failed to find a non-full server after "..maxAttempts.." attempts")
-    end
-
-    return -- BIAR SCRIPT LANJUT OTOMATIS SETELAH PINDAH SERVER
-end
 
         if getgenv().SMHubRunning then
             warn("Script is already running or has been executed! Cannot run again.")

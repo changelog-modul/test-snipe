@@ -1,0 +1,128 @@
+-- =====================================================
+-- GROW A GARDEN AUTO OSTRICH SNIPE < 10 TOKEN
+-- FROM SPAWN -> MARKET -> SPAWN (DELTA SAFE)
+-- =====================================================
+
+local TARGET_PET = "Ostrich"
+local MAX_PRICE = 9
+local SCAN_DELAY = 0.7
+local RETURN_DELAY = 2
+
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+
+-- =========================
+-- TELEPORT KE PART BY NAME
+-- =========================
+local function TPToPart(partName)
+    local char = LocalPlayer.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then return end
+
+    for _, v in pairs(workspace:GetDescendants()) do
+        if v:IsA("BasePart") and v.Name:lower():find(partName:lower()) then
+            char.HumanoidRootPart.CFrame = v.CFrame + Vector3.new(0, 3, 0)
+            return true
+        end
+    end
+    return false
+end
+
+-- =========================
+-- AMBIL UI MARKET
+-- =========================
+local function GetMarketUI()
+    local pg = LocalPlayer:WaitForChild("PlayerGui")
+
+    local paths = {
+        {"MarketGui", "Main", "Items"},
+        {"TradingGui", "MainFrame", "Items"},
+        {"ShopGui", "MainFrame", "Market", "Items"},
+    }
+
+    for _, path in ipairs(paths) do
+        local t = pg
+        local ok = true
+
+        for _, n in ipairs(path) do
+            t = t:FindFirstChild(n)
+            if not t then ok = false break end
+        end
+
+        if ok then return t end
+    end
+
+    return nil
+end
+
+-- =========================
+-- PARSE HARGA
+-- =========================
+local function ParsePrice(text)
+    if not text then return end
+    return tonumber(text:gsub("[^%d]", ""))
+end
+
+-- =========================
+-- AUTO BUY OSTRICH
+-- =========================
+local function BuyItem(itemFrame)
+    for _, v in pairs(itemFrame:GetDescendants()) do
+        if v:IsA("TextButton") and v.Text:lower():find("buy") then
+            firesignal(v.MouseButton1Click)
+            warn("✅ OSTRICH SNIPED SUCCESSFULLY!")
+            task.wait(0.4)
+        end
+    end
+end
+
+-- =========================
+-- SCAN MARKET
+-- =========================
+local function ScanMarket()
+    local Market = GetMarketUI()
+    if not Market then return false end
+
+    for _, item in pairs(Market:GetChildren()) do
+        if not item:IsA("Frame") then continue end
+
+        local nameLabel = item:FindFirstChild("PetName", true)
+        local priceLabel = item:FindFirstChild("Price", true)
+
+        if nameLabel and priceLabel then
+            local price = ParsePrice(priceLabel.Text)
+
+            if nameLabel.Text == TARGET_PET and price and price <= MAX_PRICE then
+                warn("🎯 FOUND OSTRICH:", price, "TOKEN")
+                BuyItem(item)
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
+-- =========================
+-- AUTO PILOT LOOP
+-- =========================
+task.spawn(function()
+    while task.wait(5) do
+        -- TP ke Trading Market
+        TPToPart("trade") or TPToPart("market")
+        task.wait(2)
+
+        local bought = false
+        local start = os.time()
+
+        repeat
+            bought = ScanMarket()
+            task.wait(SCAN_DELAY)
+        until bought or os.time() - start > 15
+
+        -- Balik ke Spawn Garden
+        task.wait(RETURN_DELAY)
+        TPToPart("spawn")
+    end
+end)
+
+print("✅ AUTO OSTRICH SNIPE AUTOPILOT ACTIVE (DELTA)")

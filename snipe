@@ -1,128 +1,291 @@
--- =====================================================
--- GROW A GARDEN AUTO OSTRICH SNIPE < 10 TOKEN
--- FROM SPAWN -> MARKET -> SPAWN (DELTA SAFE)
--- =====================================================
+-- Auto-buy specific pets script (Delta executor)
+-- Konfigurasi:
+local TARGET_NAMES = {"peacock"}          -- nama/keyword pet (case-insensitive). Bisa masukkan beberapa.
+local MAX_PRICE = 15                     -- maksimal token untuk membeli
+local SERVER_HOP = true                   -- apakah akan pindah server bila tidak ditemukan
+local PLACE_ID = game.PlaceId             -- biasanya tidak perlu diubah
+local REQUEST_LIMIT = 100                 -- berapa banyak server per request (Roblox API limit)
+local WAIT_BETWEEN_SCANS = 3              -- detik tunggu tiap scan sebelum serverhop/scan ulang
+local REQUEST_TIMEOUT = 10                -- timeout untuk HTTP requests
 
-local TARGET_PET = "Ostrich"
-local MAX_PRICE = 9
-local SCAN_DELAY = 0.7
-local RETURN_DELAY = 2
-
+-- INTERNAL
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
 local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
+local RunService = game:GetService("RunService")
 
--- =========================
--- TELEPORT KE PART BY NAME
--- =========================
-local function TPToPart(partName)
-    local char = LocalPlayer.Character
-    if not char or not char:FindFirstChild("HumanoidRootPart") then return end
+local lower = string.lower
 
-    for _, v in pairs(workspace:GetDescendants()) do
-        if v:IsA("BasePart") and v.Name:lower():find(partName:lower()) then
-            char.HumanoidRootPart.CFrame = v.CFrame + Vector3.new(0, 3, 0)
+-- Helper: check if a text contains any target keyword
+local function isTargetName(text)
+    if not text then return false end
+    local t = lower(tostring(text))
+    for _, kw in ipairs(TARGET_NAMES) do
+        if string.find(t, lower(kw), 1, true) then
             return true
         end
     end
     return false
 end
 
--- =========================
--- AMBIL UI MARKET
--- =========================
-local function GetMarketUI()
-    local pg = LocalPlayer:WaitForChild("PlayerGui")
-
-    local paths = {
-        {"MarketGui", "Main", "Items"},
-        {"TradingGui", "MainFrame", "Items"},
-        {"ShopGui", "MainFrame", "Market", "Items"},
-    }
-
-    for _, path in ipairs(paths) do
-        local t = pg
-        local ok = true
-
-        for _, n in ipairs(path) do
-            t = t:FindFirstChild(n)
-            if not t then ok = false break end
+-- Try common buy methods on an instance:
+-- 1) ClickDetector (fireclickdetector)
+-- 2) ProximityPrompt :InputHoldBegin/Trigger (simulate)
+-- 3) RemoteEvent named common names like "BuyPet", "PurchasePet", "BuyItem"
+local function tryPurchase(instance)
+    pcall(function()
+        -- 1) ClickDetector
+        for _, obj in ipairs(instance:GetDescendants()) do
+            if obj:IsA("ClickDetector") then
+                if fireclickdetector then
+                    pcall(function() fireclickdetector(obj) end)
+                    return true
+                else
+                    -- fallback: try to fire MouseClick via connections (best-effort)
+                    local conns = getconnections and getconnections(obj.MouseClick)
+                    if conns then
+                        for _, c in ipairs(conns) do
+                            pcall(c.Function, LocalPlayer) -- meh, risky
+                        end
+                        return true
+                    end
+                end
+            end
         end
 
-        if ok then return t end
-    end
+        -- 2) ProximityPrompt
+        for _, obj in ipairs(instance:GetDescendants()) do
+            if obj:IsA("ProximityPrompt") then
+                -- try Trigger/FireServer patterns
+                pcall(function()
+                    if obj.Trigger then
+                        obj:Trigger()
+                    else
+                        obj:InputHoldBegin()
+                        task.wait(0.1)
+                        obj:InputHoldEnd()
+                    end
+                end)
+                return true
+            end
+        end
 
+        -- 3) RemoteEvent patterns (search in ReplicatedStorage / Shared)
+        local commonRemotes = {"BuyPet", "PurchasePet", "BuyItem", "Purchase", "MarketBuy", "Buy"} -- tambahkan jika perlu
+        local searchSpaces = {game:GetService("ReplicatedStorage"), game:GetService("StarterGui"), game:GetService("Workspace")}
+        for _, name in ipairs(commonRemotes) do
+            for _, space in ipairs(searchSpaces) do
+                local rem = space:FindFirstChild(name, true)
+                if rem and rem:IsA("RemoteEvent") then
+                    -- attempt to infer needed args:
+                    -- common pattern: Remote:FireServer(petId) or Remote:FireServer(petInstance)
+                    -- we'll attempt with instance or instance.Name or instance:GetAttribute("ID")
+                    pcall(function()
+                        rem:FireServer(instance)
+                    end)
+                    pcall(function()
+                        rem:FireServer(instance.Name)
+                    end)
+                    local id = instance:GetAttribute and instance:GetAttribute("ID")
+                    if id then
+                        pcall(function() rem:FireServer(id) end)
+                    end
+                    return true
+                end
+            end
+        end
+    end)
+    return false
+end
+
+-- Parse price from a label text like "Price: 10 Tokens" or numeric Value child
+local function parsePriceFromInstance(inst)
+    -- Check for NumberValue / IntValue named "Price" or "Cost"
+    for _, child in ipairs(inst:GetChildren()) do
+        if child:IsA("NumberValue") or child:IsA("IntValue") then
+            if lower(child.Name):find("price") or lower(child.Name):find("cost") then
+                return tonumber(child.Value)
+            end
+        end
+        if child:IsA("TextLabel") or child:IsA("TextButton") then
+            local txt = child.Text
+            local num = txt:match("(%d+%.?%d*)")
+            if num then
+                return tonumber(num)
+            end
+        end
+    end
+    -- Try Name
+    local num = tostring(inst.Name):match("(%d+%.?%d*)")
+    if num then return tonumber(num) end
     return nil
 end
 
--- =========================
--- PARSE HARGA
--- =========================
-local function ParsePrice(text)
-    if not text then return end
-    return tonumber(text:gsub("[^%d]", ""))
-end
+-- Scan workspace / market UI for pets
+local function scanAndBuy()
+    local found = false
 
--- =========================
--- AUTO BUY OSTRICH
--- =========================
-local function BuyItem(itemFrame)
-    for _, v in pairs(itemFrame:GetDescendants()) do
-        if v:IsA("TextButton") and v.Text:lower():find("buy") then
-            firesignal(v.MouseButton1Click)
-            warn("✅ OSTRICH SNIPED SUCCESSFULLY!")
-            task.wait(0.4)
-        end
-    end
-end
+    -- Strategy A: scan common market folder under workspace or workspace.Market
+    local searchRoots = {workspace, workspace:FindFirstChild("Market") or workspace:FindFirstChild("Trading") or workspace:FindFirstChild("TradeBooths")}
+    -- also scan GUI (ScreenGui, Market UI)
+    local starterGui = game:GetService("StarterGui")
+    local playersGuiRoot = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if playersGuiRoot then table.insert(searchRoots, playersGuiRoot) end
+    table.insert(searchRoots, game:GetService("ReplicatedStorage"))
 
--- =========================
--- SCAN MARKET
--- =========================
-local function ScanMarket()
-    local Market = GetMarketUI()
-    if not Market then return false end
-
-    for _, item in pairs(Market:GetChildren()) do
-        if not item:IsA("Frame") then continue end
-
-        local nameLabel = item:FindFirstChild("PetName", true)
-        local priceLabel = item:FindFirstChild("Price", true)
-
-        if nameLabel and priceLabel then
-            local price = ParsePrice(priceLabel.Text)
-
-            if nameLabel.Text == TARGET_PET and price and price <= MAX_PRICE then
-                warn("🎯 FOUND OSTRICH:", price, "TOKEN")
-                BuyItem(item)
-                return true
+    for _, root in ipairs(searchRoots) do
+        if root then
+            -- iterate descendants, look for candidate pet entries with name/label matching TARGET_NAMES
+            for _, inst in ipairs(root:GetDescendants()) do
+                if inst:IsA("Model") or inst:IsA("Folder") or inst:IsA("Instance") then
+                    local nameToCheck = inst.Name or ""
+                    local labelText
+                    -- try to find a text label child
+                    for _, c in ipairs(inst:GetDescendants()) do
+                        if c:IsA("TextLabel") or c:IsA("TextButton") then
+                            labelText = c.Text
+                            break
+                        end
+                    end
+                    if isTargetName(nameToCheck) or isTargetName(labelText) then
+                        local price = parsePriceFromInstance(inst) or parsePriceFromInstance(inst.Parent) or math.huge
+                        if price and price <= MAX_PRICE then
+                            -- try to purchase
+                            local ok, err = pcall(function() return tryPurchase(inst) end)
+                            if ok then
+                                print("[AutoBuy] Attempted purchase for", inst:GetFullName(), "price:", price)
+                                found = true
+                                -- give small cooldown after buy attempt
+                                task.wait(1)
+                                -- optionally return true to stop further scanning this round
+                                return true
+                            else
+                                warn("[AutoBuy] purchase error:", err)
+                            end
+                        end
+                    end
+                end
             end
         end
     end
 
-    return false
+    -- Strategy B: check marketplace listing under workspace.Loot or similar names
+    local altNames = {"Booths", "PetBooths", "MarketBooths", "TradingBooths", "Trading"}
+    for _, alt in ipairs(altNames) do
+        local node = workspace:FindFirstChild(alt)
+        if node then
+            for _, booth in ipairs(node:GetChildren()) do
+                if isTargetName(booth.Name) then
+                    local price = parsePriceFromInstance(booth) or math.huge
+                    if price <= MAX_PRICE then
+                        tryPurchase(booth)
+                        print("[AutoBuy] tried on booth", booth.Name, price)
+                        return true
+                    end
+                end
+            end
+        end
+    end
+
+    return found
 end
 
--- =========================
--- AUTO PILOT LOOP
--- =========================
+-- SERVER HOP helper: query Roblox servers API to get list of server instances
+local function getServerList()
+    local servers = {}
+    local placeId = tostring(PLACE_ID)
+    local cursor = nil
+    local base = ("https://games.roblox.com/v1/games/%s/servers/Public?limit=%d"):format(placeId, REQUEST_LIMIT)
+    local url = base
+    local headers = {["User-Agent"] = "LuaScript"}
+    while true do
+        local ok, res = pcall(function()
+            local fullUrl = url
+            if cursor then fullUrl = fullUrl .. "&cursor=" .. HttpService:UrlEncode(cursor) end
+            local response = HttpService:GetAsync(fullUrl, true)
+            return HttpService:JSONDecode(response)
+        end)
+        if not ok or not res then break end
+        if res.data then
+            for _, s in ipairs(res.data) do
+                if s.id and tonumber(s.playing) and tonumber(s.playing) < tonumber(s.maxPlayers or 999) then
+                    table.insert(servers, s)
+                end
+            end
+        end
+        if res.nextPageCursor and res.nextPageCursor ~= "" then
+            cursor = res.nextPageCursor
+        else
+            break
+        end
+        -- safety: avoid infinite loop
+        if #servers > 500 then break end
+    end
+    return servers
+end
+
+-- choose a random server that is not the current server
+local function pickServerToHop(servers)
+    for i = 1, #servers do
+        local s = servers[math.random(1, #servers)]
+        if s.id ~= tostring(game.JobId) and s.id ~= tostring(game.JobId):gsub("-", "") then
+            return s.id
+        end
+    end
+    return nil
+end
+
+-- Main loop
 task.spawn(function()
-    while task.wait(5) do
-        -- TP ke Trading Market
-        TPToPart("trade") or TPToPart("market")
-        task.wait(2)
-
+    while true do
         local bought = false
-        local start = os.time()
-
-        repeat
-            bought = ScanMarket()
-            task.wait(SCAN_DELAY)
-        until bought or os.time() - start > 15
-
-        -- Balik ke Spawn Garden
-        task.wait(RETURN_DELAY)
-        TPToPart("spawn")
+        local suc, err = pcall(function()
+            bought = scanAndBuy()
+        end)
+        if suc and bought then
+            print("[AutoBuy] Purchase attempt made. continuing scans.")
+            -- after buying, wait a bit and continue scanning
+            task.wait(WAIT_BETWEEN_SCANS)
+        else
+            print("[AutoBuy] No suitable pet found this round.")
+            if SERVER_HOP then
+                -- attempt server hop
+                local success, serversOrErr = pcall(function() return getServerList() end)
+                if success and type(serversOrErr) == "table" and #serversOrErr > 0 then
+                    local target = pickServerToHop(serversOrErr)
+                    if target then
+                        print("[AutoBuy] Hopping to server:", target)
+                        pcall(function()
+                            TeleportService:TeleportToPlaceInstance(PLACE_ID, target, LocalPlayer)
+                        end)
+                        -- Teleport should move the player; break loop in case teleport fails
+                        task.wait(10)
+                    else
+                        print("[AutoBuy] No different server found; retrying after wait.")
+                        task.wait(WAIT_BETWEEN_SCANS)
+                    end
+                else
+                    warn("[AutoBuy] Failed to fetch server list or no servers found:", serversOrErr)
+                    task.wait(WAIT_BETWEEN_SCANS)
+                end
+            else
+                task.wait(WAIT_BETWEEN_SCANS)
+            end
+        end
+        task.wait(0.5)
     end
 end)
 
-print("✅ AUTO OSTRICH SNIPE AUTOPILOT ACTIVE (DELTA)")
+-- Anti-AFK
+pcall(function()
+    if LocalPlayer and LocalPlayer.Idled then
+        LocalPlayer.Idled:Connect(function()
+            local VirtualUser = game:GetService("VirtualUser")
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new(0,0))
+        end)
+    end
+end)
+
+print("[AutoBuy] Script loaded. Looking for:", table.concat(TARGET_NAMES, ", "), "max price:", MAX_PRICE)
